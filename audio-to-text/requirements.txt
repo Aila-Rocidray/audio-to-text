@@ -1,0 +1,7 @@
+# 运行环境要求：Python 3.10–3.12（实测 3.12）
+# 解码使用 PyAV 自带的 FFmpeg 库，无需系统安装 ffmpeg
+faster-whisper==1.2.1
+ctranslate2==4.8.4
+av==19.0.2
+onnxruntime==1.31.1
+numpy==2.5.4
