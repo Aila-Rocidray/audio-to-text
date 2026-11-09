@@ -30,6 +30,7 @@ whenToUse: 用户提供音频或视频文件（mp3/wav/m4a/mp4/mkv 等），要�
    - 中文希望输出简体 → 加 `--simplified`（配合中文音频；默认可能输出繁体。注意：提示词引导可能影响用词，重要内容需核对）。
    - 纯英文且想更快 → 加 `--fast --language en`（用 medium.en，约快 2 倍）。
    - 长音频（>10 分钟）→ 保持默认 large-v3，**必须后台运行**（见下文）。
+   - 长音频想更快 → 加 `--batch-size 16`（批量推理：VAD 切段后并行解码；本机 CPU 实测 2 分钟音频 95.7s → 77.2s，约 1.2 倍；需 VAD，会自动启用）。
    - 专有名词/人名多 → `--initial-prompt "张三, 产品名, XXX"`。
    - 只要开头 N 秒预览 → `--max-seconds 60`。
    - 批量目录 → 传目录并加 `--recursive --skip-existing`。
@@ -68,6 +69,9 @@ $tool = "<SKILL_DIR>/scripts/transcribe_audio.py"
 
 # 只转写前 2 分钟做预览
 & $py $tool "D:\audio\long.mp3" --max-seconds 120 --format txt
+
+# 长音频批量推理加速（约 1.2 倍）
+& $py $tool "D:\audio\long.mp3" --batch-size 16
 ```
 
 ## 输出文件
@@ -92,6 +96,7 @@ $tool = "<SKILL_DIR>/scripts/transcribe_audio.py"
 | `--simplified` | 中文优先输出简体（提示词引导，可能影响用词） |
 | `--vad / --no-vad` | 静音过滤，默认开启；纯音乐/噪声大时试 `--no-vad` |
 | `--initial-prompt "词1, 词2"` | 引导专有名词写法 |
+| `--batch-size N` | 批量推理加速（建议 8–16；CPU 约快 1.1–1.25 倍）；0=关闭，默认 0；`--multilingual` 下不生效 |
 | `--max-seconds N` | 只处理开头 N 秒 |
 | `--no-words` | 不要词级时间戳（更快、json 更小） |
 | `--skip-existing` | 已有输出则跳过 |
@@ -106,6 +111,7 @@ $tool = "<SKILL_DIR>/scripts/transcribe_audio.py"
 - **自动识别语言不准（短音频/安静录音常见）**：已知语言就强制 `--language zh` / `--language en`；中文输出繁体时加 `--simplified`。
 - **中英混说**：加 `--multilingual`；若结果里英文部分被翻成中文，说明整段被判成单一中文，可改用 `--language en` 或分段处理。
 - **识别出重复句/幻觉**：可试 `--no-vad`（去掉 VAD 拼接影响）或反之；`--condition-on-previous-text` 一般别开；仍不行时用 `--max-seconds` 分段排查。
+- **`--batch-size` 更慢或报内存错误**：批越大内存占用越高；报 `mkl_malloc`/内存不足就去掉参数或降到 8（程序会自动回退普通转写并告警）。CPU 上收益约 1.1–1.25 倍，短音频（<1 分钟）不建议开。
 - **要加新模型**：只能由用户确认后下载到 `asr/models/<名>`（见 `references/usage.md`），不要在任务中擅自联网。
 - **不要改 `asr/pylibs` 里的包**（其中 `faster_whisper/audio.py` 已针对新版 PyAV 打过兼容补丁）。
 

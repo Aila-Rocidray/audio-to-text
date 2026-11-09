@@ -88,6 +88,7 @@ CTranslate2 int8 量化的 Whisper large-v3（CPU）
 | `--device` | `cpu` | 有 GPU 且装了 CUDA 版 ct2 时可 `cuda` |
 | `--compute-type` | `int8` | CPU 推荐 `int8`；`float32` 更准但慢 2–3 倍 |
 | `--threads` | 0（自动） | CPU 线程数 |
+| `--batch-size N` | 0（关） | 批量推理（`BatchedInferencePipeline`，VAD 切段后并行解码）；建议 8–16，CPU 约 1.1–1.25 倍；`--multilingual` 下被忽略 |
 | `--beam-size` | 5 | 越大越准越慢 |
 | `--vad` / `--no-vad` | 开 | Silero VAD 过滤静音；纯音乐/噪声大时关闭 |
 | `--words` / `--no-words` | 开 | 词级时间戳（json 里 `words` 字段） |
@@ -189,13 +190,17 @@ Hello. Come in and take a seat.
 
 | 任务 | 模型/模式 | 音频时长 | 实际耗时 | 速度 |
 | --- | --- | --- | --- | --- |
-| 真实中文讲解视频 `zh_real.wav` | large-v3 单语种 | 122s | 77s | 1.6x 实时 |
+| 真实中文讲解视频 `zh_real.wav` | large-v3 单语种（2026-11-09 复测） | 122s | 95.7s | 1.3x 实时 |
+| 同上 + `--batch-size 16` | large-v3 批量推理 | 122s | 77.2s | 1.6x 实时 |
+| 同上 + `--batch-size 8` | large-v3 批量推理 | 122s | 89.8s | 1.4x 实时 |
 | 英文 CD 音轨 `CD1-Track01.mp3` | medium.en（`--fast`） | 195s | 71s | 2.7x 实时 |
 | 中英混说 `mixed_split.wav` | large-v3 分段多语种 | 27s | 43s | 0.6x 实时 |
 | 中文短音频 `zh_sample.wav` | large-v3 强制 zh | 6s | 10s | 0.6x 实时 |
 
 规律：
-- 长音频约 **1–1.6x 实时**（large-v3 int8），`--fast` 英文约 **2.5–3x 实时**。
+- 长音频约 **1.2–1.6x 实时**（large-v3 int8），`--fast` 英文约 **2.5–3x 实时**。
+- **`--batch-size 16` 比普通模式快约 1.2 倍**（同条件对比 95.7s → 77.2s；batch 8 只有 1.07 倍）；
+  批量模式吃内存更多，机器上同时跑别的重任务时建议降到 8 或不开。
 - 短音频/分段模式有固定的检测与加载开销，倍率会显得慢；模型加载约 5–10s，批量只加载一次。
 - 分段多语种模式每窗多一次语言检测（+10–30% 时间）；只在混说或低置信度时使用。
 - 超过 10 分钟的音频请用后台任务运行，脚本会逐段输出进度，并写 `.partial.txt` 兜底。
@@ -218,6 +223,7 @@ Hello. Come in and take a seat.
 | 音频含歌曲/音乐，识别乱 | 正常现象；VAD 只能过滤静音，不能过滤音乐 |
 | 视频没有声音 → 报错或无输出 | 视频确实无音轨；确认源文件 |
 | 处理时间过长 | 用 `--fast --language en`（纯英文）、`--no-words`、`--max-seconds` 预览 |
+| `--batch-size` 报 `mkl_malloc`/内存不足 | 批量模式内存占用更高（另开任务同时跑模型时尤其明显）；去掉参数或降到 8，程序会自动回退普通转写并告警 |
 | 想中断 | Ctrl+C；已转内容在 `<stem>.partial.txt`，不会丢 |
 
 ## 9. 添加模型（需用户确认并联网）
@@ -249,6 +255,12 @@ CPU 上 `small`/`medium` 更快但中文准确率明显低于 `large-v3`。
 
 ## 11. 修改与维护记录
 
+- 2026-11-09（功能增，v1.1.0）：新增 `--batch-size N` 批量推理（faster-whisper
+  `BatchedInferencePipeline`，VAD 切段后并行解码）。2 分钟中文实测 95.7s → 77.2s
+  （batch16，约 1.24 倍；batch8 仅 1.07 倍），文本质量无可见退化。`--multilingual`
+  下自动忽略；`--max-seconds` 时先切片再批量；初始化失败自动回退普通转写；
+  json/run-summary 增加 `batch_size`。顺带记录：并发加载两个模型会触发
+  `mkl_malloc` 内存不足，已做失败回退。
 - 2026-11-01：基于 `asr/` 里 CD 转写实验的资产，封装为 `audio-to-text` 技能 +
   `transcribe_audio.py` 统一 CLI（批量、多格式、部分输出、运行摘要）+
   `transcribe_audio.bat` 启动器。

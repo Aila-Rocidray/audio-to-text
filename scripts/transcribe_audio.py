@@ -9,6 +9,8 @@
   * 批量与目录：可一次传入多个文件、目录（--recursive）或通配符。
   * 输出：txt（纯文本）/ srt（字幕）/ md（带时间码）/ json（段级结构化）。
   * 长音频：边转写边输出（.partial.txt 兜底），中断不丢已转内容。
+  * 长音频加速：--batch-size N 启用批量推理（faster-whisper BatchedInferencePipeline，
+    VAD 切段后并行解码；CPU 实测约 1.2 倍，显存/算力富余时收益更大）。
 
 依赖放置在工作区的 asr/ 目录：
   asr/pylibs            faster-whisper 及其依赖（用 DSH 自带 Python 3.12 运行）
@@ -32,7 +34,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DEFAULT_MODEL = "large-v3"
 FAST_MODEL = "medium.en"
 
@@ -430,6 +432,15 @@ def load_whisper(libs: Path | None):
     return faster_whisper.WhisperModel, faster_whisper.__version__
 
 
+def load_batched(libs: Path | None):
+    """批量推理入口（faster-whisper >= 1.1 提供，老版本会抛 ImportError）。"""
+    if libs is not None:
+        sys.path.insert(0, str(libs))
+    import faster_whisper  # noqa: PLC0415
+
+    return faster_whisper.BatchedInferencePipeline
+
+
 SR = 16000
 LOW_CONFIDENCE = 0.62
 
@@ -737,7 +748,8 @@ def transcribe_multilingual(model, src: Path, args, partial_file):
     return rows, duration, languages
 
 
-def transcribe_one(model, whisper_version, src: Path, outdir: Path, stem: str, args, formats):
+def transcribe_one(model, whisper_version, src: Path, outdir: Path, stem: str, args, formats,
+                   batched=None):
     """转写单个文件并写出所需格式，返回结果字典。"""
     t_start = time.time()
     partial_path = outdir / f"{stem}.partial.txt"
@@ -758,7 +770,22 @@ def transcribe_one(model, whisper_version, src: Path, outdir: Path, stem: str, a
             language = choice["language"]
             prompt = build_initial_prompt(args, language)
             kwargs = transcribe_kwargs(args, language, prompt)
-            segments_iter, info = model.transcribe(str(src), **kwargs)
+            if batched is not None:
+                # 批量推理：VAD 切段 → 并行解码。--max-seconds 时先自己解码切片，
+                # 不走 clip_timestamps（批量管线对 clip 的处理方式不同）。
+                audio_arg = str(src)
+                if args.max_seconds and args.max_seconds > 0:
+                    kwargs.pop("clip_timestamps", None)
+                    audio_arg = decode_audio_file(src, args.max_seconds)
+                segments_iter, info = batched.transcribe(
+                    audio_arg,
+                    batch_size=args.batch_size,
+                    without_timestamps=False,
+                    **kwargs,
+                )
+                log(f"    推理模式    : 批量（batch_size={args.batch_size}）")
+            else:
+                segments_iter, info = model.transcribe(str(src), **kwargs)
             duration = float(info.duration or 0.0)
             language = info.language or language
             language_probability = float(info.language_probability or 0.0)
@@ -844,6 +871,7 @@ def transcribe_one(model, whisper_version, src: Path, outdir: Path, stem: str, a
                 "max_seconds": args.max_seconds,
                 "language_arg": args.language,
                 "simplified": bool(args.simplified),
+                "batch_size": int(getattr(args, "batch_size", 0) or 0),
             },
             "created_at": created_at,
             "elapsed_sec": round(total_elapsed, 2),
@@ -919,6 +947,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python transcribe_audio.py 录音.m4a --language zh --format txt,srt\n"
             "  python transcribe_audio.py 会议录音.mp4 --model large-v3 --output-dir out\n"
             "  python transcribe_audio.py 音频目录 --recursive --skip-existing\n"
+            "  python transcribe_audio.py 长会议.mp3 --batch-size 16\n"
             "  python transcribe_audio.py --list-models\n"
         ),
     )
@@ -942,6 +971,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="int8（默认，CPU 推荐）/ float32 / float16(cuda)")
     parser.add_argument("--threads", type=int, default=0,
                         help="CPU 线程数（0=自动）")
+    parser.add_argument("--batch-size", type=int, default=0, metavar="N",
+                        help="批量推理（faster-whisper BatchedInferencePipeline）：N=批大小，"
+                             "建议 8–16；0=关闭（默认）。需 VAD（会自动启用），"
+                             "CPU 实测约 1.2 倍（batch 16），显存富余时收益更大；"
+                             "--multilingual 模式下不生效。")
     parser.add_argument("--beam-size", type=int, default=5, help="beam size（默认 5）")
     parser.add_argument("--vad", dest="vad", action="store_true", default=True,
                         help="启用 Silero VAD 过滤静音（默认启用）")
@@ -983,6 +1017,7 @@ def write_run_summary(summary_path: Path, args, model_dir, formats, files,
         "language": args.language,
         "multilingual": bool(getattr(args, "multilingual", False)),
         "simplified": bool(getattr(args, "simplified", False)),
+        "batch_size": int(getattr(args, "batch_size", 0) or 0),
         "formats": formats,
         "file_count": len(files),
         "missing_inputs": missing_inputs,
@@ -1022,6 +1057,17 @@ def main(argv=None) -> int:
     if args.simplified:
         warn("提示：--simplified 通过提示词引导简体输出，可能影响用词/断句；")
         warn("      短音频或安静录音建议只作参考，必要时人工核对。")
+
+    if args.batch_size and args.batch_size > 0:
+        if args.multilingual:
+            warn("提示：分段多语种模式（--multilingual）不使用批量推理，--batch-size 已忽略。")
+            args.batch_size = 0
+        else:
+            if not args.vad:
+                warn("提示：批量推理需要 VAD 切分语音，已自动启用 VAD。")
+                args.vad = True
+            if args.batch_size > 64:
+                warn(f"提示：--batch-size {args.batch_size} 偏大（内存占用高），建议 8–16。")
 
     engine = resolve_engine()
     libs = engine["libs"]
@@ -1184,6 +1230,16 @@ def main(argv=None) -> int:
         return 2
     log(f"模型加载完成（{time.time() - t_load:.1f}s）")
 
+    batched = None
+    if getattr(args, "batch_size", 0) and args.batch_size > 0:
+        try:
+            BatchedCls = load_batched(libs)
+            batched = BatchedCls(model=model)
+            log(f"  批量推理    : 开启（batch_size={args.batch_size}，VAD 自动切段）")
+        except Exception as exc:  # noqa: BLE001 - 老版本/内存不足时回退
+            warn(f"警告：批量推理初始化失败（{exc}），回退为普通转写。")
+            batched = None
+
     for idx, item in enumerate(planned, start=1):
         src = item["src"]
         stem = item["stem"]
@@ -1200,7 +1256,7 @@ def main(argv=None) -> int:
         log(f"=== [{idx}/{len(files)}] {src.name}  ({src})")
         try:
             result = transcribe_one(
-                model, whisper_version, src, outdir, stem, args, formats
+                model, whisper_version, src, outdir, stem, args, formats, batched
             )
             results.append(result)
             log("    状态：成功")
